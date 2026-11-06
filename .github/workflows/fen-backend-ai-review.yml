@@ -1,40 +1,46 @@
 name: FEN Backend AI Review
 
-# Publica no pull request o review produzido pelo agente `fen-review-publish`
-# (ProductFactory), sempre atribuído a `github-actions[bot]`.
+# Publica no pull request o que os agentes de review do FEN produzem
+# (`fen-review-publish` em TO REVIEW, `fen-review-qa` em REVIEW/QA), sempre
+# atribuído a `github-actions[bot]`.
 #
 # Por que existe: o runner do agente autentica no GitHub com a conta de quem
-# moveu o card, e um review publicado com esse token aparece como autoria dessa
-# pessoa (com o selo "Author" quando ela é a autora do PR) e não pode sustentar
-# nenhum gate. Aqui o agente NÃO escreve no GitHub: ele dispara este workflow com
-# o review já pronto, e quem publica é o `GITHUB_TOKEN` do job.
+# moveu o card, e um comentário publicado com esse token aparece como autoria
+# dessa pessoa (com o selo "Author" quando ela é a autora do PR) e não pode
+# sustentar nenhum gate. Aqui o agente NÃO escreve no GitHub: ele dispara este
+# workflow com o conteúdo já pronto, e quem publica é o `GITHUB_TOKEN` do job.
 #
 # Disparo (da run do agente, token com escopo `repo`):
 #
 #   gh api --method POST repos/$OWNER/$REPO/dispatches --input - <<'JSON'
-#   {
-#     "event_type": "fen-backend-ai-review",
-#     "client_payload": {
-#       "pr": 7255,
-#       "sha": "<sha revisado>",
-#       "body": "<corpo com o marker fen-backend-ai-review:v1>",
-#       "comments": [
-#         {"path": "app/models/x.rb", "line": 42, "side": "RIGHT", "body": "..."}
-#       ]
-#     }
-#   }
+#   {"event_type":"fen-backend-ai-review","client_payload":{
+#     "kind": "review",
+#     "pr": 7255,
+#     "sha": "<sha revisado>",
+#     "body": "<corpo com o marker fen-backend-ai-review:v1>",
+#     "comments": [{"path":"app/models/x.rb","line":42,"side":"RIGHT","body":"..."}]
+#   }}
 #   JSON
 #
+# `kind` escolhe o que é publicado (default `review`):
+# - `review`  → um review `COMMENT` com os inline de crítico/alto/médio;
+# - `reply`   → resposta dentro de uma thread existente (`reply_to` = id do
+#               comentário raiz); marker `ai-reply:v1` vai no body;
+# - `comment` → um comentário top-level no PR (não é thread).
+#
 # Contrato:
-# - `event` é fixo em `COMMENT`. Este workflow nunca aprova nem pede mudanças
-#   (o `GITHUB_TOKEN` também não pode aprovar).
+# - `event` do review é fixo em `COMMENT`. Este workflow nunca aprova nem pede
+#   mudanças (o `GITHUB_TOKEN` também não pode aprovar).
 # - Escopo: PR aberto, **do próprio repositório**, de qualquer branch base do
 #   próprio repositório — inclusive PR empilhado (base = outra branch de
 #   trabalho). PR de fork é recusado: ali a autoria e o diff não são confiáveis.
-# - Um review por sha: se já existe review com `reviewed_sha=<sha>` no PR, não
-#   publica de novo.
+# - O `sha` tem de pertencer ao PR (cabeça atual ou commit anterior), em todos
+#   os kinds — é ele que ancora o marker de idempotência.
+# - Idempotência: `review` não republica um sha que já tem `reviewed_sha=<sha>`;
+#   `reply` não repete um marker `thread=<id> sha=<sha>` na mesma thread;
+#   `comment` só tem idempotência quando o payload manda `idempotency_key`.
 # - Payload inválido falha com `invalid_payload: <motivo>` para o agente ler e
-#   repassar no handoff.
+#   repassar no handoff; recusa da API falha com `publish_rejected: <status>`.
 # - O `client_payload` do repository_dispatch tem teto de 64 KB (limite do
 #   GitHub). O agente capa o corpo e no máximo 15 comentários inline.
 #
@@ -49,44 +55,57 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  issues: write
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - name: Publicar review como github-actions[bot]
+      - name: Publicar como github-actions[bot]
         uses: actions/github-script@v7
         with:
           script: |
             const MAX_BODY = 60000;
             const MAX_INLINE = 15;
             const MAX_INLINE_BODY = 10000;
-            const MAX_REVIEW_PAGES = 5;
+            const MAX_KEY = 200;
+            const MAX_PAGES = 5;
 
             const fail = (reason) => core.setFailed(`invalid_payload: ${reason}`);
 
             const payload = context.payload.client_payload || {};
+            const kind = payload.kind === undefined ? 'review' : payload.kind;
             const pr = payload.pr;
             const sha = String(payload.sha || '');
             const body = payload.body;
-            const comments = payload.comments === undefined ? [] : payload.comments;
 
+            if (!['review', 'reply', 'comment'].includes(kind)) {
+              return fail('kind must be review, reply or comment');
+            }
             if (!Number.isInteger(pr) || pr <= 0) return fail('pr must be a positive integer');
             if (!/^[0-9a-f]{40}$/.test(sha)) return fail('sha must be a 40-char lowercase sha');
             if (typeof body !== 'string' || body.trim() === '') return fail('body is required');
             if (body.length > MAX_BODY) return fail(`body over ${MAX_BODY} chars`);
-            if (!Array.isArray(comments)) return fail('comments must be an array');
-            if (comments.length > MAX_INLINE) return fail(`comments over ${MAX_INLINE} inline findings`);
 
-            for (const [i, c] of comments.entries()) {
-              if (!c || typeof c !== 'object') return fail(`comments[${i}] is not an object`);
-              if (typeof c.path !== 'string' || c.path === '' || c.path.startsWith('/') || c.path.split('/').includes('..')) {
-                return fail(`comments[${i}].path is not a repository path`);
+            const key = payload.idempotency_key === undefined ? null : payload.idempotency_key;
+            if (key !== null && (typeof key !== 'string' || key.trim() === '' || key.length > MAX_KEY)) {
+              return fail(`idempotency_key must be a non-empty string up to ${MAX_KEY} chars`);
+            }
+
+            const comments = payload.comments === undefined ? [] : payload.comments;
+            if (kind === 'review') {
+              if (!Array.isArray(comments)) return fail('comments must be an array');
+              if (comments.length > MAX_INLINE) return fail(`comments over ${MAX_INLINE} inline findings`);
+              for (const [i, c] of comments.entries()) {
+                if (!c || typeof c !== 'object') return fail(`comments[${i}] is not an object`);
+                if (typeof c.path !== 'string' || c.path === '' || c.path.startsWith('/') || c.path.split('/').includes('..')) {
+                  return fail(`comments[${i}].path is not a repository path`);
+                }
+                if (!Number.isInteger(c.line) || c.line <= 0) return fail(`comments[${i}].line must be positive`);
+                if (c.side !== 'RIGHT' && c.side !== 'LEFT') return fail(`comments[${i}].side must be RIGHT or LEFT`);
+                if (typeof c.body !== 'string' || c.body.trim() === '') return fail(`comments[${i}].body is required`);
+                if (c.body.length > MAX_INLINE_BODY) return fail(`comments[${i}].body over ${MAX_INLINE_BODY} chars`);
               }
-              if (!Number.isInteger(c.line) || c.line <= 0) return fail(`comments[${i}].line must be positive`);
-              if (c.side !== 'RIGHT' && c.side !== 'LEFT') return fail(`comments[${i}].side must be RIGHT or LEFT`);
-              if (typeof c.body !== 'string' || c.body.trim() === '') return fail(`comments[${i}].body is required`);
-              if (c.body.length > MAX_INLINE_BODY) return fail(`comments[${i}].body over ${MAX_INLINE_BODY} chars`);
             }
 
             const { owner, repo } = context.repo;
@@ -112,7 +131,7 @@ jobs:
             // O sha revisado tem de pertencer ao PR (cabeça atual ou commit anterior).
             if (sha !== pull.head.sha) {
               let found = false;
-              for (let page = 1; page <= MAX_REVIEW_PAGES && !found; page += 1) {
+              for (let page = 1; page <= MAX_PAGES && !found; page += 1) {
                 const { data } = await github.rest.pulls.listCommits({
                   owner, repo, pull_number: pr, per_page: 100, page,
                 });
@@ -122,46 +141,117 @@ jobs:
               if (!found) return fail(`sha ${sha} does not belong to pr #${pr}`);
             }
 
-            // Um review por sha: não republica o que já está lá.
-            for (let page = 1; page <= MAX_REVIEW_PAGES; page += 1) {
-              const { data } = await github.rest.pulls.listReviews({
-                owner, repo, pull_number: pr, per_page: 100, page,
-              });
-              const existing = data.find((review) => String(review.body || '').includes(`reviewed_sha=${sha}`));
-              if (existing) {
-                core.notice(`review for ${sha} already exists (id ${existing.id}); nothing to publish`);
-                core.setOutput('review_id', String(existing.id));
-                core.setOutput('review_url', existing.html_url || '');
-                core.setOutput('skipped', 'true');
+            const done = async ({ id, url, author, skipped = false }) => {
+              core.setOutput('kind', kind);
+              core.setOutput('skipped', String(skipped));
+              core.setOutput('id', String(id || ''));
+              core.setOutput('url', url || '');
+              core.setOutput('author', author || '');
+              await core.summary
+                .addHeading(skipped ? 'Nada a publicar' : 'Publicado')
+                .addRaw(`kind \`${kind}\` · PR #${pr} · sha \`${sha}\` · autor \`${author || '?'}\``)
+                .write();
+            };
+
+            if (kind === 'review') {
+              // Um review por sha: não republica o que já está lá.
+              for (let page = 1; page <= MAX_PAGES; page += 1) {
+                const { data } = await github.rest.pulls.listReviews({
+                  owner, repo, pull_number: pr, per_page: 100, page,
+                });
+                const existing = data.find((review) => String(review.body || '').includes(`reviewed_sha=${sha}`));
+                if (existing) {
+                  core.notice(`review for ${sha} already exists (id ${existing.id}); nothing to publish`);
+                  return done({ id: existing.id, url: existing.html_url, author: existing.user && existing.user.login, skipped: true });
+                }
+                if (data.length < 100) break;
+              }
+
+              let review;
+              try {
+                ({ data: review } = await github.rest.pulls.createReview({
+                  owner,
+                  repo,
+                  pull_number: pr,
+                  commit_id: sha,
+                  event: 'COMMENT',
+                  body,
+                  comments,
+                }));
+              } catch (error) {
+                // Posição fora do diff, sha desconhecido ou body grande demais: a
+                // API é all-or-nothing e derruba o review inteiro.
+                core.setFailed(`publish_rejected: ${error.status || '?'} ${error.message}`);
                 return;
               }
-              if (data.length < 100) break;
+              return done({ id: review.id, url: review.html_url, author: review.user && review.user.login });
             }
 
-            let review;
+            if (kind === 'reply') {
+              const replyTo = payload.reply_to;
+              if (!Number.isInteger(replyTo) || replyTo <= 0) return fail('reply_to must be a positive review comment id');
+
+              // A thread tem de ser deste PR.
+              let target;
+              try {
+                ({ data: target } = await github.rest.pulls.getReviewComment({ owner, repo, comment_id: replyTo }));
+              } catch (error) {
+                if (error.status === 404) return fail(`comment ${replyTo} not found`);
+                throw error;
+              }
+              if (!String(target.pull_request_url || '').endsWith(`/pulls/${pr}`)) {
+                return fail(`comment ${replyTo} does not belong to pr #${pr}`);
+              }
+              const rootId = target.in_reply_to_id || replyTo;
+              const marker = key || `thread=${rootId} sha=${sha}`;
+
+              // Já respondida para este sha: não repete.
+              for (let page = 1; page <= MAX_PAGES; page += 1) {
+                const { data } = await github.rest.pulls.listReviewComments({
+                  owner, repo, pull_number: pr, per_page: 100, page,
+                });
+                const existing = data.find((c) => c.in_reply_to_id === rootId && String(c.body || '').includes(marker));
+                if (existing) {
+                  core.notice(`reply for ${marker} already exists (id ${existing.id}); nothing to publish`);
+                  return done({ id: existing.id, url: existing.html_url, author: existing.user && existing.user.login, skipped: true });
+                }
+                if (data.length < 100) break;
+              }
+
+              let reply;
+              try {
+                ({ data: reply } = await github.rest.pulls.createReplyForReviewComment({
+                  owner, repo, pull_number: pr, comment_id: rootId, body,
+                }));
+              } catch (error) {
+                core.setFailed(`publish_rejected: ${error.status || '?'} ${error.message}`);
+                return;
+              }
+              return done({ id: reply.id, url: reply.html_url, author: reply.user && reply.user.login });
+            }
+
+            // kind === 'comment': comentário top-level no PR (API de issues).
+            if (key) {
+              for (let page = 1; page <= MAX_PAGES; page += 1) {
+                const { data } = await github.rest.issues.listComments({
+                  owner, repo, issue_number: pr, per_page: 100, page,
+                });
+                const existing = data.find((c) => String(c.body || '').includes(key));
+                if (existing) {
+                  core.notice(`comment for ${key} already exists (id ${existing.id}); nothing to publish`);
+                  return done({ id: existing.id, url: existing.html_url, author: existing.user && existing.user.login, skipped: true });
+                }
+                if (data.length < 100) break;
+              }
+            }
+
+            let comment;
             try {
-              ({ data: review } = await github.rest.pulls.createReview({
-                owner,
-                repo,
-                pull_number: pr,
-                commit_id: sha,
-                event: 'COMMENT',
-                body,
-                comments,
+              ({ data: comment } = await github.rest.issues.createComment({
+                owner, repo, issue_number: pr, body,
               }));
             } catch (error) {
-              // Posição fora do diff, sha desconhecido ou body grande demais: a
-              // API é all-or-nothing e derruba o review inteiro.
               core.setFailed(`publish_rejected: ${error.status || '?'} ${error.message}`);
               return;
             }
-
-            core.setOutput('review_id', String(review.id));
-            core.setOutput('review_url', review.html_url || '');
-            core.setOutput('author', (review.user && review.user.login) || '');
-            core.setOutput('skipped', 'false');
-            await core.summary
-              .addHeading('Review publicado')
-              .addRaw(`PR #${pr} · sha \`${sha}\` · autor \`${(review.user && review.user.login) || '?'}\``)
-              .addLink(`review ${review.id}`, review.html_url || '')
-              .write();
+            return done({ id: comment.id, url: comment.html_url, author: comment.user && comment.user.login });
