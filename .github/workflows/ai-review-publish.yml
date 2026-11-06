@@ -13,7 +13,7 @@ name: AI Review Publish
 #
 #   gh api --method POST repos/$OWNER/$REPO/dispatches --input - <<'JSON'
 #   {
-#     "event_type": "ai-review",
+#     "event_type": "fen-backend-ai-review",
 #     "client_payload": {
 #       "pr": 7255,
 #       "sha": "<sha revisado>",
@@ -41,7 +41,7 @@ name: AI Review Publish
 
 on:
   repository_dispatch:
-    types: [ai-review]
+    types: [fen-backend-ai-review]
 
 permissions:
   contents: read
