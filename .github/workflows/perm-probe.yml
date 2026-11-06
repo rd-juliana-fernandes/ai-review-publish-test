@@ -1,0 +1,66 @@
+name: Perm Probe
+
+# Sonda descartável: prova se `issues: write` é necessária para publicar
+# review, resposta de thread e comentário top-level em um PR.
+# Sem `issues: write` DE PROPÓSITO.
+
+on:
+  repository_dispatch:
+    types: [perm-probe]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tentar as tres operacoes sem issues:write
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.client_payload.pr;
+            const { owner, repo } = context.repo;
+            const results = [];
+            const sha = context.payload.client_payload.sha;
+
+            // 1) review
+            try {
+              const { data } = await github.rest.pulls.createReview({
+                owner, repo, pull_number: pr, commit_id: sha, event: 'COMMENT',
+                body: '<!-- probe-review -->\nsonda: review sem issues:write',
+              });
+              results.push(`review: OK id=${data.id}`);
+            } catch (e) { results.push(`review: FALHOU ${e.status} ${e.message}`); }
+
+            // 2) comentario top-level (API de issues)
+            let rootId = null;
+            try {
+              const { data } = await github.rest.issues.createComment({
+                owner, repo, issue_number: pr,
+                body: '<!-- probe-comment -->\nsonda: comentario top-level sem issues:write',
+              });
+              results.push(`comment: OK id=${data.id}`);
+            } catch (e) { results.push(`comment: FALHOU ${e.status} ${e.message}`); }
+
+            // 3) reply em thread — precisa de um comentario de review existente
+            try {
+              const { data: rcs } = await github.rest.pulls.listReviewComments({
+                owner, repo, pull_number: pr, per_page: 100,
+              });
+              const root = rcs.find((c) => !c.in_reply_to_id);
+              if (!root) {
+                results.push('reply: PULADO (sem thread)');
+              } else {
+                const { data } = await github.rest.pulls.createReplyForReviewComment({
+                  owner, repo, pull_number: pr, comment_id: root.id,
+                  body: '<!-- probe-reply -->\nsonda: reply sem issues:write',
+                });
+                results.push(`reply: OK id=${data.id}`);
+              }
+            } catch (e) { results.push(`reply: FALHOU ${e.status} ${e.message}`); }
+
+            const text = results.join('\n');
+            await core.summary.addHeading('Resultado da sonda').addRaw('```\n' + text + '\n```').write();
+            core.info(text);
