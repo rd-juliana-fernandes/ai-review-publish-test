@@ -28,6 +28,9 @@ name: FEN Backend AI Review
 # Contrato:
 # - `event` é fixo em `COMMENT`. Este workflow nunca aprova nem pede mudanças
 #   (o `GITHUB_TOKEN` também não pode aprovar).
+# - Escopo: PR aberto, **do próprio repositório**, de qualquer branch base do
+#   próprio repositório — inclusive PR empilhado (base = outra branch de
+#   trabalho). PR de fork é recusado: ali a autoria e o diff não são confiáveis.
 # - Um review por sha: se já existe review com `reviewed_sha=<sha>` no PR, não
 #   publica de novo.
 # - Payload inválido falha com `invalid_payload: <motivo>` para o agente ler e
@@ -88,7 +91,7 @@ jobs:
 
             const { owner, repo } = context.repo;
 
-            // O PR tem de ser do próprio repositório, aberto e com base na main.
+            // O PR tem de ser do próprio repositório e estar aberto.
             let pull;
             try {
               ({ data: pull } = await github.rest.pulls.get({ owner, repo, pull_number: pr }));
@@ -97,8 +100,14 @@ jobs:
               throw error;
             }
             if (pull.state !== 'open') return fail(`pr #${pr} is ${pull.state}`);
-            if (pull.base.ref !== 'main') return fail(`pr #${pr} targets ${pull.base.ref}, not main`);
+            // Escopo: mesmo repositório dos dois lados. Qualquer branch base do
+            // próprio repositório vale — PR empilhado tem base numa branch de
+            // trabalho, e o diff do agente é contra essa base. Fork é recusado.
             if (pull.base.repo.full_name !== `${owner}/${repo}`) return fail(`pr #${pr} is not from ${owner}/${repo}`);
+            if (!pull.head.repo || pull.head.repo.full_name !== `${owner}/${repo}`) {
+              return fail(`pr #${pr} comes from a fork (${(pull.head.repo && pull.head.repo.full_name) || 'deleted repo'})`);
+            }
+            if (!pull.base.ref) return fail(`pr #${pr} has no base ref`);
 
             // O sha revisado tem de pertencer ao PR (cabeça atual ou commit anterior).
             if (sha !== pull.head.sha) {
